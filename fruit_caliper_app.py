@@ -44,10 +44,19 @@ def make_roi_mask(shape, rect):
     m = np.zeros((h,w), np.uint8); m[y1:y2, x1:x2] = 255
     return m
 
-def ring_mask(shape, x,y,r, inner=0.80, outer=1.20):
-    rr = np.zeros(shape[:2], np.uint8)
-    cv2.circle(rr,(x,y), int(max(1, r*outer)), 255, -1)
-    cv2.circle(rr,(x,y), int(max(1, r*inner)),   0, -1)
+def ring_mask(img, x, y, r, inner=0.80, outer=1.20):
+    """Return a binary mask for an annulus centered at (x, y).
+
+    The previous implementation expected a shape tuple but the callers
+    provided the full image array. Using the array directly caused
+    ``TypeError: only integer scalar arrays can be converted`` when
+    creating the mask. Now the function derives the shape from the image
+    itself, making the call sites consistent.
+    """
+    h, w = img.shape[:2]
+    rr = np.zeros((h, w), np.uint8)
+    cv2.circle(rr, (x, y), int(max(1, r * outer)), 255, -1)
+    cv2.circle(rr, (x, y), int(max(1, r * inner)), 0, -1)
     return rr
 
 # ------------- Auto moneda -------------------
