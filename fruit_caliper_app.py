@@ -1,17 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-Fruit Caliper – Aforo (v4.1 con ROI, zoom/pan y auto-calibración de moneda)
-Requisitos:
-  pip install opencv-python numpy pillow pandas
-
-Uso rápido:
-  1) Archivo → Cargar fotos (Ctrl+O)
-  2) 🪙 Auto-calibrar (o 📏 2 clics en diámetro de la moneda)
-  3) 🟩 ROI (arrastrar) para limitar a la copa
-  4) 👁️ Vista previa y ajusta parámetros (Min/Max mm, Color %, Hue σ, Edge ring %, Hough p2)
-  5) Rellena Nº árboles y Árboles muestreados → ▶️ Procesar todas
-"""
-
 import os, math, cv2, numpy as np, pandas as pd
 from PIL import Image, ImageTk
 import tkinter as tk
@@ -45,14 +32,7 @@ def make_roi_mask(shape, rect):
     return m
 
 def ring_mask(img, x, y, r, inner=0.80, outer=1.20):
-    """Return a binary mask for an annulus centered at (x, y).
-
-    The previous implementation expected a shape tuple but the callers
-    provided the full image array. Using the array directly caused
-    ``TypeError: only integer scalar arrays can be converted`` when
-    creating the mask. Now the function derives the shape from the image
-    itself, making the call sites consistent.
-    """
+    """Máscara de anillo centrado en (x,y)."""
     h, w = img.shape[:2]
     rr = np.zeros((h, w), np.uint8)
     cv2.circle(rr, (x, y), int(max(1, r * outer)), 255, -1)
@@ -108,8 +88,8 @@ def detect_candidates(bgr, px_per_mm, min_mm, max_mm, blur, hough_p2, roi_mask):
             cands.append((x,y,r))
     return cands, work, (min_r, max_r)
 
-def quality_filters(work, cands, color_ratio_min, hue_std_max, edge_ring_min, roi_mask=None):
-    """Filtro por color (HSV), uniformidad de tono y borde en anillo."""
+def quality_filters(work, cands, color_ratio_min, hue_std_max, edge_ring_min, roi_cover_min, roi_mask=None):
+    """Filtro por color (HSV), uniformidad de tono, borde en anillo y cobertura en ROI."""
     hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)
     edges = cv2.Canny(cv2.cvtColor(work, cv2.COLOR_BGR2GRAY), 70, 170)
     green = cv2.inRange(hsv, (20,30,35), (85,255,255))
@@ -117,28 +97,32 @@ def quality_filters(work, cands, color_ratio_min, hue_std_max, edge_ring_min, ro
     h,w = work.shape[:2]
 
     for (x,y,r) in cands:
-        # máscara circular rellena (sin ogrid)
-        circ = np.zeros((h,w), np.uint8)
-        cv2.circle(circ,(x,y),r,255,-1)
-        if roi_mask is not None: circ = cv2.bitwise_and(circ, roi_mask)
+        base = np.zeros((h,w), np.uint8)
+        cv2.circle(base,(x,y),r,255,-1)
+        if roi_mask is not None:
+            inside = cv2.countNonZero(cv2.bitwise_and(base, roi_mask))
+            cover = inside / max(1, cv2.countNonZero(base))
+            if cover < roi_cover_min:
+                continue
+            circ = cv2.bitwise_and(base, roi_mask)
+            ring = cv2.bitwise_and(ring_mask(work,x,y,r,0.85,1.15), roi_mask)
+        else:
+            circ = base
+            ring = ring_mask(work,x,y,r,0.85,1.15)
 
         area = max(1, cv2.countNonZero(circ))
         on_color = cv2.countNonZero(cv2.bitwise_and(green, green, mask=circ))
         color_ratio = on_color/area
-        if color_ratio < color_ratio_min: 
+        if color_ratio < color_ratio_min:
             continue
 
-        # Uniformidad de tono (σ de Hue)
         h_vals = hsv[:,:,0][circ.astype(bool)]
-        if h_vals.size < 10: 
+        if h_vals.size < 10:
             continue
         hue_std = float(np.std(h_vals))
         if hue_std > hue_std_max:
             continue
 
-        # Borde en anillo
-        ring = ring_mask(work, x,y,r, 0.85, 1.15)
-        if roi_mask is not None: ring = cv2.bitwise_and(ring, roi_mask)
         ring_count = max(1, cv2.countNonZero(ring))
         ring_edges = cv2.countNonZero(cv2.bitwise_and(edges, edges, mask=ring))
         ring_edge_frac = ring_edges / ring_count
@@ -191,6 +175,10 @@ class App(tk.Tk):
         self.zoom = 1.0
         self.px_per_mm = None
 
+        self.detections = []        # detecciones actuales
+        self.edit_mode = False
+        self.preview_method = ""
+
         # modos
         self.calibrating = False
         self.calib_pts = []
@@ -214,6 +202,7 @@ class App(tk.Tk):
         tk.Button(self.ctrl, text="🟩 ROI (arrastrar)", command=self.start_roi).pack(side="left", padx=6)
         tk.Button(self.ctrl, text="✖ Quitar ROI", command=self.clear_roi).pack(side="left", padx=6)
         tk.Button(self.ctrl, text="👁️ Vista previa", command=self.preview_current).pack(side="left", padx=6)
+        tk.Button(self.ctrl, text="✏️ Editar", command=self.toggle_edit).pack(side="left", padx=6)
         tk.Button(self.ctrl, text="▶️ Procesar todas", command=self.process_all).pack(side="left", padx=6)
         self.scale_lbl = tk.Label(self.ctrl, text="Escala: pendiente"); self.scale_lbl.pack(side="left", padx=12)
 
@@ -229,6 +218,7 @@ class App(tk.Tk):
         self.color_pct = tk.DoubleVar(value=0.12)   # 12%
         self.hue_std_max = tk.DoubleVar(value=12.0) # σ de Hue máx (0-180)
         self.edge_ring_min = tk.DoubleVar(value=0.22)
+        self.roi_cover_min = tk.DoubleVar(value=0.8)
 
         def add_param(lbl, var, w=6):
             f = tk.Frame(self.ctrl); f.pack(side="left", padx=5)
@@ -240,6 +230,7 @@ class App(tk.Tk):
         add_param("Color %", self.color_pct, 6)
         add_param("Hue σ máx", self.hue_std_max, 6)
         add_param("Edge ring %", self.edge_ring_min, 6)
+        add_param("ROI cover %", self.roi_cover_min, 6)
 
         # Barra aforo
         self.aforo = tk.Frame(self); self.aforo.pack(fill="x", padx=8, pady=4)
@@ -299,6 +290,16 @@ class App(tk.Tk):
         self.display_bgr = overlay
         self.render()
 
+    def draw_detections(self):
+        over = self.base_bgr.copy()
+        for d in self.detections:
+            color = (0,255,0) if d['keep'] else (0,0,255)
+            cv2.circle(over,(d['x'],d['y']),d['r'],color,2)
+            cv2.circle(over,(d['x'],d['y']),2,(0,255,255),2)
+            dmm = (2*d['r'])/self.px_per_mm if self.px_per_mm else 0
+            cv2.putText(over,f"{round(dmm)}mm",(d['x']-20,d['y']-10), cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2,cv2.LINE_AA)
+        self.show_overlay(over)
+
     def set_zoom(self, val):
         if self.base_bgr is None: return
         self.zoom = max(0.25, min(6.0, float(val)))
@@ -318,6 +319,8 @@ class App(tk.Tk):
         self.scale_lbl["text"] = "Escala: pendiente"
         self.px_per_mm = None
         self.roi_rect = None
+        self.detections = []
+        self.edit_mode = False
 
     # ---------- Calibración ----------
     def auto_calibrate(self):
@@ -341,6 +344,7 @@ class App(tk.Tk):
             messagebox.showinfo("Info","Carga primero una foto."); return
         self.calibrating = True; self.calib_pts.clear()
         self.roi_selecting = False
+        self.edit_mode = False
         self.status["text"] = "Calibración: 2 clics en extremos del DIÁMETRO de la moneda."
 
     # ---------- ROI ----------
@@ -348,6 +352,7 @@ class App(tk.Tk):
         if self.base_bgr is None:
             messagebox.showinfo("Info","Carga una foto primero."); return
         self.roi_selecting = True; self.calibrating = False
+        self.edit_mode = False
         self.roi_start = None
         self.status["text"] = "ROI: arrastra con botón izquierdo alrededor de la COPA."
 
@@ -355,11 +360,24 @@ class App(tk.Tk):
         self.roi_selecting = False; self.roi_rect = None; self.render()
         self.status["text"] = "ROI quitada."
 
+    def toggle_edit(self):
+        if not self.detections:
+            messagebox.showinfo("Info","Primero usa Vista previa.")
+            return
+        self.edit_mode = not self.edit_mode
+        self.status["text"] = "Edición ON: clic para alternar" if self.edit_mode else "Edición OFF"
+
     # ---------- Eventos izq ----------
     def on_left_down(self, e):
         if self.base_bgr is None: return
         x = self.canvas.canvasx(e.x)/self.zoom; y = self.canvas.canvasy(e.y)/self.zoom
-        if self.roi_selecting:
+        if self.edit_mode and self.detections:
+            for d in self.detections:
+                if distance((x,y),(d['x'],d['y'])) <= d['r']:
+                    d['keep'] = not d['keep']
+                    self.draw_detections()
+                    break
+        elif self.roi_selecting:
             self.roi_start = (x,y)
         elif self.calibrating:
             self.calib_pts.append((x,y))
@@ -404,25 +422,24 @@ class App(tk.Tk):
         color_pct = float(self.color_pct.get())
         hue_std_max = float(self.hue_std_max.get())
         edge_ring_min = float(self.edge_ring_min.get())
+        roi_cover_min = float(self.roi_cover_min.get())
         roi_mask = make_roi_mask(self.base_bgr.shape, self.roi_rect)
 
         cands, work, (rmin,rmax) = detect_candidates(self.base_bgr, self.px_per_mm, min_mm, max_mm, blur, p2, roi_mask)
-        found = quality_filters(work, cands, color_pct, hue_std_max, edge_ring_min, roi_mask)
+        found = quality_filters(work, cands, color_pct, hue_std_max, edge_ring_min, roi_cover_min, roi_mask)
 
         used_fallback = False
         if not found and self.modo_robusto.get():
             found = detect_by_contours(self.base_bgr, self.px_per_mm, min_mm, max_mm, blur, roi_mask)
             used_fallback = bool(found)
 
-        over = self.base_bgr.copy()
-        for (x,y,r) in found:
-            dmm = (2*r)/self.px_per_mm
-            cv2.circle(over,(x,y),r,(0,255,0),2); cv2.circle(over,(x,y),2,(0,0,255),3)
-            cv2.putText(over,f"{round(dmm)}mm",(x-20,y-10), cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2,cv2.LINE_AA)
-        self.show_overlay(over)
+        self.detections = [{"x":x,"y":y,"r":r,"keep":True} for (x,y,r) in found]
+        self.preview_method = "contornos" if used_fallback else "hough_filtros"
+        self.edit_mode = False
+        self.draw_detections()
 
         metodo = "Contornos" if used_fallback else "Hough+filtros"
-        self.status["text"] = f"Vista previa: {len(found)} frutos. R(px) {rmin}-{rmax}. Método: {metodo}."
+        self.status["text"] = f"Vista previa: {len(self.detections)} frutos. R(px) {rmin}-{rmax}. Método: {metodo}."
 
     def process_all(self):
         if not self.img_paths:
@@ -435,6 +452,7 @@ class App(tk.Tk):
         color_pct = float(self.color_pct.get())
         hue_std_max = float(self.hue_std_max.get())
         edge_ring_min = float(self.edge_ring_min.get())
+        roi_cover_min = float(self.roi_cover_min.get())
         muestreados = max(1,int(self.arboles_muestreados.get()))
         total_arboles = max(1,int(self.num_arboles.get()))
         rho = float(self.densidad.get()); k = float(self.factor_forma.get())
@@ -451,12 +469,16 @@ class App(tk.Tk):
             if bgr is None: continue
             roi_mask = roi_mask_base if (roi_mask_base is not None and bgr.shape==self.base_bgr.shape) else None
 
-            cands, work, _ = detect_candidates(bgr, self.px_per_mm, min_mm, max_mm, blur, p2, roi_mask)
-            found = quality_filters(work, cands, color_pct, hue_std_max, edge_ring_min, roi_mask)
-            used_fallback = False
-            if not found and self.modo_robusto.get():
-                found = detect_by_contours(bgr, self.px_per_mm, min_mm, max_mm, blur, roi_mask)
-                used_fallback = bool(found)
+            if p == self.img_paths[0] and self.detections:
+                found = [(d['x'],d['y'],d['r']) for d in self.detections if d['keep']]
+                used_fallback = (self.preview_method == 'contornos')
+            else:
+                cands, work, _ = detect_candidates(bgr, self.px_per_mm, min_mm, max_mm, blur, p2, roi_mask)
+                found = quality_filters(work, cands, color_pct, hue_std_max, edge_ring_min, roi_cover_min, roi_mask)
+                used_fallback = False
+                if not found and self.modo_robusto.get():
+                    found = detect_by_contours(bgr, self.px_per_mm, min_mm, max_mm, blur, roi_mask)
+                    used_fallback = bool(found)
 
             over = bgr.copy()
             name = os.path.splitext(os.path.basename(p))[0]
